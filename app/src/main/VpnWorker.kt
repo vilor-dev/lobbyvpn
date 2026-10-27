@@ -1,104 +1,56 @@
-// lang: Kotlin, file: VpnWorker.kt
-// real VpnService tunnel — routes all traffic through selected server via socket protect
+// lang: Kotlin, file: VpnWorker.kt — OpenVPN3 via Intent bridge
+// routes through ics-openvpn (de.blinkt.openvpn) which handles the real tunnel
 package com.noob.lobbyvpn
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
+import android.app.Service
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
-import android.net.VpnService
-import android.os.Build
-import android.os.ParcelFileDescriptor
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.DatagramPacket
+import android.os.IBinder
 
-class VpnWorker : VpnService() {
-
-    private var tun: ParcelFileDescriptor? = null
-    private var running = false
+class VpnWorker : Service() {
 
     companion object {
         var currentServer: Server? = null
         const val ACTION_START = "START"
         const val ACTION_STOP  = "STOP"
-        const val CHANNEL_ID   = "vpn_channel"
-    }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) { stop(); return START_NOT_STICKY }
-        currentServer?.let { start(it) }
-        return START_STICKY
-    }
+        // ics-openvpn external control — launches tunnel from .ovpn file
+        private const val ICS_PKG    = "de.blinkt.openvpn"
+        private const val ICS_LAUNCH = "$ICS_PKG.LaunchVPN"
 
-    private fun start(s: Server) {
-        createNotificationChannel()
-        startForeground(1, buildNotification(s))
-
-        val builder = Builder()
-            .setSession("LobbyVPN")
-            .addAddress("10.0.0.2", 24)
-            .addDnsServer("1.1.1.1")
-            .addRoute("0.0.0.0", 0)   // route all traffic
-            .setMtu(1500)
-
-        tun = builder.establish() ?: return
-        running = true
-
-        Thread {
-            val sock = DatagramSocket()
-            protect(sock)   // bypass VPN for tunnel socket itself
-            val remote = InetAddress.getByName(s.host)
-
-            val inBuf  = ByteArray(32767)
-            val outBuf = ByteArray(32767)
-            val input  = tun!!.fileDescriptor.let {
-                java.io.FileInputStream(it)
+        fun startTunnel(ctx: Context, server: Server) {
+            val cfg = VpnConfigManager.writeConfig(ctx, server)
+            val i = Intent().apply {
+                component = ComponentName(ICS_PKG, ICS_LAUNCH)
+                putExtra("net.openvpn.openvpn.PROFILE_PATH", cfg.absolutePath)
+                putExtra("net.openvpn.openvpn.PROFILE_NAME", "${server.countryShort}-${server.ip}")
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
             }
-            val output = tun!!.fileDescriptor.let {
-                java.io.FileOutputStream(it)
+            try { ctx.startActivity(i) }
+            catch (_: Exception) {
+                // ics-openvpn not installed — fall back to raw VpnService tunnel
+                RawTunnelWorker.start(ctx, server)
             }
+        }
 
-            // raw UDP tunnel — production would layer WireGuard or OpenVPN framing here
-            while (running) {
-                try {
-                    val n = input.read(inBuf)
-                    if (n > 0) {
-                        val pkt = DatagramPacket(inBuf, n, remote, s.port)
-                        sock.send(pkt)
-                    }
-                    val resp = DatagramPacket(outBuf, outBuf.size)
-                    sock.soTimeout = 20
-                    try {
-                        sock.receive(resp)
-                        if (resp.length > 0) output.write(outBuf, 0, resp.length)
-                    } catch (_: Exception) {}
-                } catch (e: Exception) {
-                    if (running) continue else break
-                }
+        fun stopTunnel(ctx: Context) {
+            val i = Intent().apply {
+                component = ComponentName(ICS_PKG, "$ICS_PKG.DisconnectVPN")
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
             }
-            sock.close()
-        }.start()
-    }
-
-    private fun stop() {
-        running = false
-        tun?.close()
-        stopForeground(true)
-        stopSelf()
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            val ch = NotificationChannel(CHANNEL_ID, "VPN", NotificationManager.IMPORTANCE_LOW)
-            getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+            try { ctx.startActivity(i) }
+            catch (_: Exception) { RawTunnelWorker.stop() }
         }
     }
 
-    private fun buildNotification(s: Server): Notification =
-        Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("LobbyVPN — ${s.country}")
-            .setContentText("connected ${s.host}:${s.port}")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .build()
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START -> currentServer?.let { startTunnel(this, it) }
+            ACTION_STOP  -> stopTunnel(this)
+        }
+        return START_NOT_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
 }
