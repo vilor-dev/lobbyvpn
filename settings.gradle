@@ -1,0 +1,3 @@
+// lang: Groovy, file: settings.gradle
+rootProject.name = "lobbyvpn"
+include ':app'
