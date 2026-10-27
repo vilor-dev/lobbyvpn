@@ -1,5 +1,4 @@
-// lang: Kotlin, file: MainActivity.kt
-// UI is intentionally shit — raw layouts, no styling, vpn is the point
+// lang: Kotlin, file: MainActivity.kt — live fetch, country picker, auto modes
 package com.noob.lobbyvpn
 
 import android.app.Activity
@@ -9,120 +8,121 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.widget.*
-import java.util.Calendar
+import kotlinx.coroutines.*
 
 class MainActivity : Activity() {
 
-    private val VPN_REQUEST = 1
-    private var autoHandler  = Handler(Looper.getMainLooper())
+    private val scope       = MainScope()
+    private val autoHandler = Handler(Looper.getMainLooper())
     private var autoRunnable: Runnable? = null
-    private var selectedServer: Server? = null
+    private val VPN_REQ     = 1
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // raw layout — no XML, pure ugly code-built UI
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(4, 4, 4, 4)
+            setPadding(2, 2, 2, 2)
         }
 
-        val title = TextView(this).apply { text = "LOBBYVPN v1"; textSize = 11f }
-        root.addView(title)
+        val title  = TextView(this).apply { text = "LOBBYVPN"; textSize = 10f }
+        val status = TextView(this).apply { text = "idle"; textSize = 9f }
+        val fetchBtn = Button(this).apply { text = "FETCH SERVERS" }
 
-        // country spinner
-        val spinnerLabel = TextView(this).apply { text = "country:" }
-        root.addView(spinnerLabel)
+        val countryLabel = TextView(this).apply { text = "country:" }
+        val countrySpinner = Spinner(this)
 
-        val spinner = Spinner(this)
-        val names = ServerList.all.map { "${it.code} ${it.country}" }
-        spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, names)
-        root.addView(spinner)
+        val autoLow  = CheckBox(this).apply { text = "auto low density" }
+        val autoHour = CheckBox(this).apply { text = "auto hour rotate" }
 
-        // auto-low-density toggle
-        val autoLow = CheckBox(this).apply { text = "auto low density" }
-        root.addView(autoLow)
+        val connect = Button(this).apply { text = "CONNECT" }
+        val stop    = Button(this).apply { text = "STOP" }
 
-        // auto-hour toggle
-        val autoHour = CheckBox(this).apply { text = "auto by hour" }
-        root.addView(autoHour)
+        for (v in listOf(title, fetchBtn, status, countryLabel,
+                         countrySpinner, autoLow, autoHour, connect, stop))
+            root.addView(v)
 
-        // status dump
-        val status = TextView(this).apply {
-            text = "status: idle"
-            textSize = 9f
-        }
-        root.addView(status)
+        setContentView(root)
 
-        // connect button — ugly, no style
-        val btnConnect = Button(this).apply { text = "CONNECT" }
-        root.addView(btnConnect)
-
-        val btnStop = Button(this).apply { text = "STOP" }
-        root.addView(btnStop)
-
-        btnConnect.setOnClickListener {
-            val server = when {
-                autoHour.isChecked  -> ServerList.byHour()
-                autoLow.isChecked   -> ServerList.lowestDensity(1).first()
-                else -> ServerList.all[spinner.selectedItemPosition]
+        fetchBtn.setOnClickListener {
+            status.text = "fetching..."
+            scope.launch {
+                ServerList.fetch()
+                val codes = ServerList.allCountries()
+                val adapter = ArrayAdapter(this@MainActivity,
+                    android.R.layout.simple_spinner_item, codes)
+                countrySpinner.adapter = adapter
+                status.text = "loaded ${ServerList.cached.size} servers"
             }
-            selectedServer = server
-            VpnWorker.currentServer = server
-            status.text = "connecting → ${server.country} ${server.host}"
+        }
 
-            val intent = VpnService.prepare(this)
-            if (intent != null) startActivityForResult(intent, VPN_REQUEST)
-            else startVpn()
+        connect.setOnClickListener {
+            val server = when {
+                autoHour.isChecked -> ServerList.byHour()
+                autoLow.isChecked  -> ServerList.byDensity().firstOrNull()
+                else -> {
+                    val code = countrySpinner.selectedItem as? String ?: ""
+                    ServerList.byCountry(code).firstOrNull()
+                        ?: ServerList.cached.firstOrNull()
+                }
+            } ?: run { status.text = "no servers — fetch first"; return@setOnClickListener }
+
+            VpnWorker.currentServer = server
+            status.text = "→ ${server.countryLong} ${server.ip} ping:${server.ping}ms"
+
+            val perm = VpnService.prepare(this)
+            if (perm != null) startActivityForResult(perm, VPN_REQ)
+            else launchVpn(server)
 
             if (autoHour.isChecked) startAutoRotate(status)
         }
 
-        btnStop.setOnClickListener {
+        stop.setOnClickListener {
             stopAutoRotate()
-            startService(Intent(this, VpnWorker::class.java).apply {
-                action = VpnWorker.ACTION_STOP
-            })
-            status.text = "status: stopped"
+            startService(Intent(this, VpnWorker::class.java)
+                .apply { action = VpnWorker.ACTION_STOP })
+            status.text = "stopped"
         }
-
-        setContentView(root)
     }
 
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
-        if (req == VPN_REQUEST && res == RESULT_OK) startVpn()
+        if (req == VPN_REQ && res == RESULT_OK)
+            VpnWorker.currentServer?.let { launchVpn(it) }
     }
 
-    private fun startVpn() {
-        startService(Intent(this, VpnWorker::class.java).apply {
-            action = VpnWorker.ACTION_START
-        })
+    private fun launchVpn(s: Server) {
+        startService(Intent(this, VpnWorker::class.java)
+            .apply { action = VpnWorker.ACTION_START })
     }
 
     private fun startAutoRotate(status: TextView) {
         stopAutoRotate()
         autoRunnable = object : Runnable {
             override fun run() {
-                val next = ServerList.byHour()
-                VpnWorker.currentServer = next
-                // restart service with new server
-                startService(Intent(this@MainActivity, VpnWorker::class.java).apply {
-                    action = VpnWorker.ACTION_STOP
-                })
-                Handler(Looper.getMainLooper()).postDelayed({
-                    startVpn()
-                    status.text = "auto → ${next.country} ${next.host}"
-                }, 1500)
-                // check again in 60 minutes
+                scope.launch {
+                    ServerList.fetch()
+                    val next = ServerList.byHour() ?: return@launch
+                    VpnWorker.currentServer = next
+                    startService(Intent(this@MainActivity, VpnWorker::class.java)
+                        .apply { action = VpnWorker.ACTION_STOP })
+                    delay(1500)
+                    launchVpn(next)
+                    status.text = "rotated → ${next.countryLong} ${next.ip}"
+                }
                 autoHandler.postDelayed(this, 60 * 60 * 1000L)
             }
         }
-        // first rotation check in 60 min
         autoHandler.postDelayed(autoRunnable!!, 60 * 60 * 1000L)
     }
 
     private fun stopAutoRotate() {
         autoRunnable?.let { autoHandler.removeCallbacks(it) }
         autoRunnable = null
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        scope.cancel()
+        stopAutoRotate()
     }
 }
