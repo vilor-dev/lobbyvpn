@@ -1,44 +1,87 @@
-// lang: Kotlin, file: ServerList.kt
+// lang: Kotlin, file: ServerList.kt — live VPN Gate fetcher
 package com.noob.lobbyvpn
 
+import android.util.Base64
+import kotlinx.coroutines.*
+import java.net.URL
+
 data class Server(
-    val country: String,
-    val code: String,
-    val host: String,
-    val port: Int,
-    // lower = fewer BS players = better lobby spread
-    val density: Int
+    val hostname: String,
+    val ip: String,
+    val score: Long,
+    val ping: Int,
+    val speed: Long,
+    val countryLong: String,
+    val countryShort: String,
+    val sessions: Int,
+    val ovpnConfig: String   // decoded .ovpn text
 )
 
 object ServerList {
-    val all = listOf(
-        Server("Moldova",        "MD", "94.176.233.11",   1194, 1),
-        Server("Kazakhstan",     "KZ", "185.220.101.5",   1194, 2),
-        Server("Georgia",        "GE", "185.220.101.8",   1194, 2),
-        Server("Armenia",        "AM", "185.220.101.12",  1194, 1),
-        Server("Albania",        "AL", "185.220.101.15",  1194, 2),
-        Server("North Macedonia","MK", "185.220.101.19",  1194, 1),
-        Server("Montenegro",     "ME", "185.220.101.22",  1194, 1),
-        Server("Bolivia",        "BO", "186.10.68.5",     1194, 2),
-        Server("Paraguay",       "PY", "186.10.68.9",     1194, 2),
-        Server("Nicaragua",      "NI", "190.60.33.14",    1194, 1),
-        Server("Honduras",       "HN", "190.60.33.18",    1194, 1),
-        Server("El Salvador",    "SV", "190.60.33.22",    1194, 1),
-        Server("Mongolia",       "MN", "103.26.68.5",     1194, 1),
-        Server("Cambodia",       "KH", "103.26.68.9",     1194, 2),
-        Server("Laos",           "LA", "103.26.68.13",    1194, 1),
-        Server("Iceland",        "IS", "185.220.101.30",  1194, 3),
-        Server("Latvia",         "LV", "185.220.101.34",  1194, 3),
-        Server("Estonia",        "EE", "185.220.101.38",  1194, 3)
+
+    private const val API = "https://www.vpngate.net/api/iphone/"
+
+    var cached: List<Server> = emptyList()
+        private set
+
+    suspend fun fetch(): List<Server> = withContext(Dispatchers.IO) {
+        try {
+            val raw = URL(API).readText()
+            val lines = raw.lines()
+                .dropWhile { !it.startsWith("*vpn_servers") }
+                .drop(2)                          // skip *vpn_servers + header
+                .filter { it.isNotBlank() && !it.startsWith("*") }
+
+            cached = lines.mapNotNull { parseLine(it) }
+            cached
+        } catch (e: Exception) {
+            cached  // return last good list on fail
+        }
+    }
+
+    private fun parseLine(line: String): Server? {
+        // CSV has commas inside base64 — split on first 14 commas only
+        val parts = line.split(",", limit = 15)
+        if (parts.size < 15) return null
+        return try {
+            val ovpnRaw = parts[14].trim()
+            val ovpn = String(Base64.decode(ovpnRaw, Base64.DEFAULT))
+            Server(
+                hostname     = parts[0],
+                ip           = parts[1],
+                score        = parts[2].toLongOrNull() ?: 0L,
+                ping         = parts[3].toIntOrNull() ?: 999,
+                speed        = parts[4].toLongOrNull() ?: 0L,
+                countryLong  = parts[5],
+                countryShort = parts[6],
+                sessions     = parts[7].toIntOrNull() ?: 0,
+                ovpnConfig   = ovpn
+            )
+        } catch (_: Exception) { null }
+    }
+
+    // low player density countries for Brawl Stars lobby spread
+    private val lowDensityCodes = setOf(
+        "MD","KZ","GE","AM","AL","MK","ME","BO","PY","NI","HN","SV","MN","KH","LA","IS","LV","EE"
     )
 
-    fun lowestDensity(count: Int = 3) =
-        all.sortedBy { it.density }.take(count)
+    fun byDensity(): List<Server> {
+        val low = cached.filter { it.countryShort in lowDensityCodes }
+        return if (low.isNotEmpty()) low.sortedBy { it.ping }
+               else cached.sortedBy { it.ping }
+    }
 
-    fun byHour(): Server {
+    fun byHour(): Server? {
+        val pool = byDensity().take(6)
+        if (pool.isEmpty()) return null
         val h = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
-        // rotate through low-density pool by hour slot
-        val pool = lowestDensity(6)
         return pool[h % pool.size]
     }
+
+    fun byCountry(code: String): List<Server> =
+        cached.filter { it.countryShort.equals(code, ignoreCase = true) }
+              .sortedBy { it.ping }
+
+    fun allCountries(): List<String> =
+        cached.map { it.countryShort }.distinct().sorted()
 }
